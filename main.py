@@ -1020,12 +1020,17 @@ client = MyBot()
 # ---------------------------------------------------------------
 # 9. スラッシュコマンドの定義
 # ---------------------------------------------------------------
-@client.tree.command(
-    name='dentaku',
-    description='電卓機能（ボタン式の電卓を表示、または式を渡して計算）',
+CALC_DESCRIPTION = '電卓機能（ボタン式の電卓を表示、または式を渡して計算）'
+CALC_EXPRESSION_DESCRIPTION = (
+    '計算したい式を入力するとその場で計算します（例: (1 + 2) * 3）。'
+    '省略するとボタン式の電卓を表示'
 )
-@app_commands.describe(式='計算したい式を入力するとその場で計算します（例: (1 + 2) * 3）。省略するとボタン式の電卓を表示')
-async def dentaku(interaction: discord.Interaction, 式: str | None = None):
+# `/dentaku` のほか、英語名の `/calc` `/calculator` でも同じ電卓を使えるようにする
+CALC_COMMAND_NAMES = ('dentaku', 'calc', 'calculator')
+
+
+async def run_calculator(interaction: discord.Interaction, 式: str | None = None):
+  """電卓コマンドの共通処理（式があれば計算、なければボタン式の電卓を表示）。"""
   # 式が指定されたら、その場で計算して結果を返す
   if 式 is not None:
     try:
@@ -1046,6 +1051,26 @@ async def dentaku(interaction: discord.Interaction, 式: str | None = None):
   await interaction.response.send_message(
       content=view.render(), view=view, allowed_mentions=NO_MENTIONS
   )
+
+
+def make_calculator_command(name: str) -> app_commands.Command:
+  """電卓コマンドを組み立てる（同じ処理を複数の名前で登録するため）。"""
+
+  async def callback(interaction: discord.Interaction, 式: str | None = None):
+    await run_calculator(interaction, 式)
+
+  callback.__name__ = f'calc_{name}'
+  command = app_commands.Command(
+      name=name, description=CALC_DESCRIPTION, callback=callback
+  )
+  app_commands.describe(
+      式=CALC_EXPRESSION_DESCRIPTION
+  )(command)
+  return command
+
+
+for _calc_name in CALC_COMMAND_NAMES:
+  client.tree.add_command(make_calculator_command(_calc_name))
 
 
 memo_group = app_commands.Group(name='memo', description='メモの追加・一覧・削除')
@@ -1715,14 +1740,14 @@ async def help_command(interaction: discord.Interaction):
       color=discord.Color.blurple(),
   )
   embed.add_field(
-      name='🧮 `/dentaku [式]`',
+      name='🧮 `/dentaku` `/calc` `/calculator`（同じ電卓）',
       value=(
-          '電卓機能です。\n'
+          '3つの名前のどれでも同じ電卓が使えます。\n'
           '・式を省略 → ボタン式の電卓を表示（`=` で計算、`C` でクリア）\n'
           '・式を指定 → その場で計算して結果を表示\n'
           '使える演算: `+` `-` `*` `/` `%` `**` `( )` と括弧\n'
           '全角の `×` `÷` `＋` `（）` やカンマ区切り（`1,000`）も使えます。\n'
-          '例: `/dentaku 式:(1 + 2) * 3`'
+          '例: `/dentaku 式:(1 + 2) * 3` / `/calc 式:10/4` / `/calculator`'
       ),
       inline=False,
   )
