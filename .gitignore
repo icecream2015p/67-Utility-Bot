@@ -1,8 +1,10 @@
 .env
 
-# メモの保存ファイル（実行時に生成されるためコミットしない）
+# メモ・リマインダーの保存ファイル（実行時に生成されるためコミットしない）
 memos.json
 memos.json.tmp
+reminders.json
+reminders.json.tmp
 
 # Python
 .venv/
