@@ -453,6 +453,86 @@ class TodoFormatTest(unittest.TestCase):
     self.assertEqual(main.split_chunks('header\n', []), ['header'])
 
 
+class CalculatorAliasTest(unittest.TestCase):
+  """`/dentaku` が `/calc` `/calculator` でも使えることを確認する。"""
+
+  def test_all_names_registered_with_same_options(self):
+    commands = {c.name: c for c in main.client.tree.get_commands()}
+    for name in ('dentaku', 'calc', 'calculator'):
+      with self.subTest(name=name):
+        self.assertIn(name, commands)
+        command = commands[name]
+        self.assertEqual(
+            [(p.name, p.required) for p in command.parameters], [('式', False)]
+        )
+        self.assertEqual(command.description, main.CALC_DESCRIPTION)
+
+  def test_payload_is_valid(self):
+    tree = main.client.tree
+    payload = {
+        c.name: c.to_dict(tree)
+        for c in tree.get_commands()
+        if c.name in ('dentaku', 'calc', 'calculator')
+    }
+    self.assertEqual(len(payload), 3)
+    for name, data in payload.items():
+        with self.subTest(name=name):
+            self.assertEqual(data['name'], name)
+            self.assertEqual(data['type'], 1)  # CHAT_INPUT
+            self.assertEqual([o['name'] for o in data['options']], ['式'])
+            self.assertEqual(data['options'][0]['type'], 3)  # STRING
+            self.assertFalse(data['options'][0]['required'])
+            self.assertIn(0, data['integration_types'])
+
+
+class CalculatorAliasBehaviorTest(unittest.IsolatedAsyncioTestCase):
+  """エイリアス経由でも電卓の処理が動くことを確認する。"""
+
+  async def test_expression_is_evaluated(self):
+    class FakeResponse:
+
+      def __init__(self):
+        self.messages = []
+
+      async def send_message(self, content=None, **kwargs):
+        self.messages.append((content, kwargs))
+
+    class FakeInteraction:
+
+      def __init__(self):
+        self.response = FakeResponse()
+
+    commands = {c.name: c for c in main.client.tree.get_commands()}
+    for name in ('dentaku', 'calc', 'calculator'):
+      with self.subTest(name=name):
+        interaction = FakeInteraction()
+        await commands[name].callback(interaction, 式='(1+2)*3')
+        content, kwargs = interaction.response.messages[0]
+        self.assertIn('= **9**', content)
+        self.assertEqual(kwargs['allowed_mentions'], main.NO_MENTIONS)
+
+  async def test_without_expression_shows_view(self):
+    class FakeResponse:
+
+      def __init__(self):
+        self.messages = []
+
+      async def send_message(self, content=None, **kwargs):
+        self.messages.append((content, kwargs))
+
+    class FakeInteraction:
+
+      def __init__(self):
+        self.response = FakeResponse()
+
+    commands = {c.name: c for c in main.client.tree.get_commands()}
+    interaction = FakeInteraction()
+    await commands['calculator'].callback(interaction, 式=None)
+    content, kwargs = interaction.response.messages[0]
+    self.assertIn('電卓', content)
+    self.assertIsInstance(kwargs['view'], main.CalculatorView)
+
+
 class NotificationLoopTest(unittest.IsolatedAsyncioTestCase):
   """通知ループの配送テスト（Discordへの通信はモックする）。"""
 
