@@ -339,8 +339,267 @@ class ReminderStore:
 reminder_store = ReminderStore(REMINDER_FILE, os.environ.get('BOT_TIMEZONE', DEFAULT_TIMEZONE))
 
 
+
 # ---------------------------------------------------------------
-# 4. 日時の入力を解釈する（「10:30」「2026/11/20 10:30」「30分後」など）
+# 4. TODOの保存先（ユーザーごとにJSONファイルへ保存）
+# ---------------------------------------------------------------
+TODO_FILE = Path(
+    os.environ.get('TODO_FILE', Path(__file__).with_name('todos.json'))
+)
+
+
+class TodoError(Exception):
+  """TODO操作のユーザー向けエラー。"""
+
+
+TODO_PRIORITIES = {'高': 3, '中': 2, '低': 1}
+
+
+class TodoStore:
+  """ユーザーごとのTODOをJSONファイルで管理するクラス。
+
+  保存形式:
+    {"<user_id>": [{"id": 1, "text": "...", "done": false,
+                    "priority": "中", "due": "ISO8601" | null}]}
+  """
+
+  def __init__(self, path: Path, tz: tzinfo):
+    self.path = Path(path)
+    self._lock = Lock()
+    self._data = self._load()
+    self._tz = tz
+
+  def now(self) -> datetime:
+    return datetime.now(self._tz)
+
+  def _load(self) -> dict[str, list[dict]]:
+    try:
+      with self.path.open(encoding='utf-8') as f:
+        data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+      return {}
+    if not isinstance(data, dict):
+      return {}
+    cleaned: dict[str, list[dict]] = {}
+    for key, value in data.items():
+      if not isinstance(value, list):
+        continue
+      items = []
+      for raw in value:
+        if not isinstance(raw, dict):
+          continue
+        text = str(raw.get('text', '')).strip()
+        if not text:
+          continue
+        due = raw.get('due')
+        if isinstance(due, str):
+          try:
+            due = datetime.fromisoformat(due).isoformat()
+          except ValueError:
+            due = None
+        else:
+          due = None
+        priority = raw.get('priority')
+        if priority not in TODO_PRIORITIES:
+          priority = '中'
+        items.append({
+            'id': int(raw.get('id', 0)) or len(items) + 1,
+            'text': text,
+            'done': bool(raw.get('done', False)),
+            'priority': priority,
+            'due': due,
+            'notified': bool(raw.get('notified', False)),
+        })
+      cleaned[str(key)] = items
+    return cleaned
+
+  def _save(self) -> None:
+    self.path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = self.path.with_name(self.path.name + '.tmp')
+    with tmp.open('w', encoding='utf-8') as f:
+      json.dump(self._data, f, ensure_ascii=False, indent=2)
+    tmp.replace(self.path)
+
+  def add(
+      self,
+      user_id: int,
+      text: str,
+      priority: str = '中',
+      due: datetime | None = None,
+  ) -> dict:
+    text = text.strip()
+    if not text:
+      raise TodoError('TODOの内容が空です。')
+    if priority not in TODO_PRIORITIES:
+      raise TodoError('優先度は 高 / 中 / 低 から選んでください。')
+    if due is not None and due.tzinfo is None:
+      due = due.replace(tzinfo=self._tz)
+    with self._lock:
+      items = self._data.setdefault(str(user_id), [])
+      next_id = max((item['id'] for item in items), default=0) + 1
+      item = {
+          'id': next_id,
+          'text': text,
+          'done': False,
+          'priority': priority,
+          'due': due.isoformat() if due else None,
+          'notified': False,
+      }
+      items.append(item)
+      self._save()
+      return dict(item)
+
+  def list_for_user(
+      self, user_id: int, include_done: bool = False
+  ) -> list[dict]:
+    """未完了を先に、優先度が高い順 → 期限が近い順で返す。"""
+    with self._lock:
+      items = [dict(item) for item in self._data.get(str(user_id), [])]
+    if not include_done:
+      items = [item for item in items if not item['done']]
+
+    def sort_key(item):
+      # 未完了(0) → 完了(1)、優先度は高い順、期限なしは最後
+      has_due = item.get('due') is not None
+      return (
+          1 if item['done'] else 0,
+          -TODO_PRIORITIES[item['priority']],
+          0 if has_due else 1,
+          item.get('due') or '',
+          item['id'],
+      )
+
+    items.sort(key=sort_key)
+    return items
+
+  def get(self, user_id: int, todo_id: int) -> dict | None:
+    with self._lock:
+      for item in self._data.get(str(user_id), []):
+        if item['id'] == todo_id:
+          return dict(item)
+    return None
+
+  def set_done(self, user_id: int, todo_id: int, done: bool = True) -> dict:
+    with self._lock:
+      for item in self._data.get(str(user_id), []):
+        if item['id'] == todo_id:
+          item['done'] = done
+          self._save()
+          return dict(item)
+    raise TodoError(f'ID {todo_id} のTODOは見つかりません。')
+
+  def remove(self, user_id: int, todo_id: int) -> dict:
+    with self._lock:
+      items = self._data.get(str(user_id), [])
+      for index, item in enumerate(items):
+        if item['id'] == todo_id:
+          removed = items.pop(index)
+          self._save()
+          return dict(removed)
+    raise TodoError(f'ID {todo_id} のTODOは見つかりません。')
+
+  def clear_done(self, user_id: int) -> int:
+    """完了済みのTODOをまとめて削除し、削除件数を返す。"""
+    with self._lock:
+      items = self._data.get(str(user_id), [])
+      remaining = [item for item in items if not item['done']]
+      removed = len(items) - len(remaining)
+      if removed:
+        self._data[str(user_id)] = remaining
+        self._save()
+      return removed
+
+  def due_reminders(
+      self, now: datetime | None = None
+  ) -> list[tuple[int, dict]]:
+    """期限が来た未完了TODOのうち、まだ通知していないものを返す。"""
+    now = now or self.now()
+    ready: list[tuple[int, dict]] = []
+    with self._lock:
+      for key, items in self._data.items():
+        for item in items:
+          if item['done'] or item.get('notified') or not item.get('due'):
+            continue
+          try:
+            due_at = datetime.fromisoformat(item['due'])
+          except ValueError:
+            continue
+          if due_at.tzinfo is None:
+            due_at = due_at.replace(tzinfo=self._tz)
+          if due_at <= now:
+            ready.append((int(key), dict(item)))
+    ready.sort(key=lambda pair: pair[1]['due'])
+    return ready
+
+  def mark_notified(self, user_id: int, todo_id: int) -> None:
+    with self._lock:
+      for item in self._data.get(str(user_id), []):
+        if item['id'] == todo_id:
+          item['notified'] = True
+          self._save()
+          return
+
+  def stats(self, user_id: int) -> dict:
+    """件数の集計（全体・未完了・今日締切・期限切れ）。"""
+    now = self.now()
+    items = self.list_for_user(user_id, include_done=True)
+    open_items = [item for item in items if not item['done']]
+    today = now.date()
+    due_today = []
+    overdue = []
+    for item in open_items:
+      if not item.get('due'):
+        continue
+      due_at = datetime.fromisoformat(item['due'])
+      if due_at.tzinfo is None:
+        due_at = due_at.replace(tzinfo=self._tz)
+      if due_at.date() < today:
+        overdue.append(item)
+      elif due_at.date() == today:
+        due_today.append(item)
+    return {
+        'total': len(items),
+        'open': len(open_items),
+        'done': len(items) - len(open_items),
+        'today': len(due_today),
+        'overdue': len(overdue),
+    }
+
+
+todo_store = TodoStore(TODO_FILE, reminder_store.tz)
+
+
+def format_due_short(due: str | None, now: datetime) -> str:
+  """TODOの期限を「今日 18:00」「2026/11/20」「期限切れ」のように表す。"""
+  if not due:
+    return '期限なし'
+  due_at = datetime.fromisoformat(due)
+  if due_at.tzinfo is None:
+    due_at = due_at.replace(tzinfo=reminder_store.tz)
+  unix = int(due_at.timestamp())
+  if due_at.date() < now.date():
+    label = '⚠️ 期限切れ'
+  elif due_at.date() == now.date():
+    label = '今日'
+  elif due_at.date() == (now + timedelta(days=1)).date():
+    label = '明日'
+  else:
+    label = due_at.strftime('%Y/%m/%d')
+  time_part = '' if (due_at.hour, due_at.minute) == (0, 0) else due_at.strftime(' %H:%M')
+  return f'{label}{time_part} (<t:{unix}:R>)'
+
+
+def is_due_expired(due: str | None, now: datetime) -> bool:
+  if not due:
+    return False
+  due_at = datetime.fromisoformat(due)
+  if due_at.tzinfo is None:
+    due_at = due_at.replace(tzinfo=reminder_store.tz)
+  return due_at < now
+
+
+# ---------------------------------------------------------------
+# 5. 日時の入力を解釈する（「10:30」「2026/11/20 10:30」「30分後」など）
 # ---------------------------------------------------------------
 _UNIT_SECONDS = {
     '秒': 1,
@@ -486,7 +745,7 @@ def format_duration(delta: timedelta) -> str:
 
 
 # ---------------------------------------------------------------
-# 5. 電卓の計算処理（安全に式を評価する）
+# 6. 電卓の計算処理（安全に式を評価する）
 # ---------------------------------------------------------------
 _MAX_EXPRESSION_LENGTH = 200
 _MAX_POW_EXPONENT = 1000
@@ -603,7 +862,7 @@ def safe_eval(expression: str) -> float | int:
 
 
 # ---------------------------------------------------------------
-# 6. 電卓のボタンUI
+# 7. 電卓のボタンUI
 # ---------------------------------------------------------------
 class CalculatorView(discord.ui.View):
   """ボタンで操作できる電卓。"""
@@ -729,7 +988,7 @@ def shorten(text: str, limit: int = 200) -> str:
 
 
 # ---------------------------------------------------------------
-# 7. ユーザーインストール対応のBotクラス
+# 8. ユーザーインストール対応のBotクラス
 # ---------------------------------------------------------------
 class MyBot(discord.Client):
 
@@ -749,8 +1008,8 @@ class MyBot(discord.Client):
     # Discordにスラッシュコマンドを同期する
     await self.tree.sync()
     print("スラッシュコマンドの同期が完了しました")
-    # リマインダーの通知ループを開始する
-    reminder_loop.start()
+    # 通知ループ（リマインダー・TODO）を開始する
+    notification_loop.start()
 
   async def on_ready(self):
     print(f"ログインしました: {client.user}")
@@ -759,7 +1018,7 @@ class MyBot(discord.Client):
 client = MyBot()
 
 # ---------------------------------------------------------------
-# 8. スラッシュコマンドの定義
+# 9. スラッシュコマンドの定義
 # ---------------------------------------------------------------
 @client.tree.command(
     name='dentaku',
@@ -1122,41 +1381,61 @@ client.tree.add_command(reminder_group)
 
 
 # ---------------------------------------------------------------
-# 9. リマインダーの通知ループ
+# 10. 通知ループ（リマインダー・TODO）
 # ---------------------------------------------------------------
-@tasks.loop(seconds=30)
-async def reminder_loop():
-  """期限が来たリマインダーを30秒ごとに確認して通知する。"""
-  for user_id, item in reminder_store.due():
-    due_at = datetime.fromisoformat(item['due'])
-    message = (
-        f'⏰ **リマインダー**\n'
-        f'> {escape_markdown(shorten(item["text"], 1500))}\n'
-        f'-# 期限: {format_datetime(due_at)}'
-    )
-    delivered = False
+async def notify_reminder(user_id: int, item: dict) -> bool:
+  """リマインダーをDM→登録チャンネルの順で通知し、送信できたら True を返す。"""
+  due_at = datetime.fromisoformat(item['due'])
+  message = (
+      f'⏰ **リマインダー**\n'
+      f'> {escape_markdown(shorten(item["text"], 1500))}\n'
+      f'-# 期限: {format_datetime(due_at)}'
+  )
 
-    # まずはDMで通知する
+  # まずはDMで通知する
+  try:
+    user = client.get_user(user_id) or await client.fetch_user(user_id)
+    await user.send(message, allowed_mentions=NO_MENTIONS)
+    return True
+  except Exception as e:  # noqa: BLE001 - DMが閉じている場合など
+    print(f'リマインダーのDM送信に失敗しました user={user_id}: {e}')
+
+  # DMに失敗したら、登録時のチャンネルに送る
+  if item.get('channel_id'):
     try:
-      user = client.get_user(user_id) or await client.fetch_user(user_id)
-      await user.send(message, allowed_mentions=NO_MENTIONS)
-      delivered = True
-    except Exception as e:  # noqa: BLE001 - DMが閉じている場合など
-      print(f'リマインダーのDM送信に失敗しました user={user_id}: {e}')
+      channel = client.get_channel(
+          item['channel_id']
+      ) or await client.fetch_channel(item['channel_id'])
+      await channel.send(message, allowed_mentions=NO_MENTIONS)
+      return True
+    except Exception as e:  # noqa: BLE001
+      print(f'リマインダーの送信に失敗しました channel={item["channel_id"]}: {e}')
+  return False
 
-    # DMに失敗したら、登録時のチャンネルに送る
-    if not delivered and item.get('channel_id'):
-      try:
-        channel = client.get_channel(
-            item['channel_id']
-        ) or await client.fetch_channel(item['channel_id'])
-        await channel.send(message, allowed_mentions=NO_MENTIONS)
-        delivered = True
-      except Exception as e:  # noqa: BLE001
-        print(f'リマインダーの送信に失敗しました channel={item["channel_id"]}: {e}')
 
-    # 送信できたものは完了扱いにする
-    if delivered:
+async def notify_todo(user_id: int, item: dict) -> bool:
+  """TODOの期日をDMで通知する（1件につき1回だけ）。"""
+  due_at = datetime.fromisoformat(item['due'])
+  message = (
+      f'📋 **TODOの期限です**\n'
+      f'> {escape_markdown(shorten(item["text"], 1500))}\n'
+      f'-# 優先度: {item["priority"]} / 期限: {format_datetime(due_at)}\n'
+      f'-# 完了にする: `/todo done 番号:{item["id"]}`'
+  )
+  try:
+    user = client.get_user(user_id) or await client.fetch_user(user_id)
+    await user.send(message, allowed_mentions=NO_MENTIONS)
+    return True
+  except Exception as e:  # noqa: BLE001 - DMが閉じている場合など
+    print(f'TODO通知のDM送信に失敗しました user={user_id}: {e}')
+    return False
+
+
+async def process_due_notifications() -> None:
+  """期限が来たリマインダーとTODOを通知する（テストからも直接呼べる）。"""
+  # --- リマインダー ---
+  for user_id, item in reminder_store.due():
+    if await notify_reminder(user_id, item):
       reminder_store.mark_done(user_id, item['id'])
       continue
 
@@ -1169,18 +1448,263 @@ async def reminder_loop():
           f'（{attempts}回失敗）'
       )
 
+  # --- TODOの期日 ---
+  for user_id, item in todo_store.due_reminders():
+    await notify_todo(user_id, item)
+    # DMが送れなくても再通知でスパムにならないよう、通知済みにする
+    todo_store.mark_notified(user_id, item['id'])
 
-@reminder_loop.error
-async def reminder_loop_error(error: BaseException):
-  print(f'リマインダーループでエラーが発生しました: {error}')
+
+@tasks.loop(seconds=30)
+async def notification_loop():
+  """期限が来たリマインダー・TODOを30秒ごとに確認して通知する。"""
+  await process_due_notifications()
 
 
-@reminder_loop.before_loop
-async def reminder_loop_before():
+@notification_loop.error
+async def notification_loop_error(error: BaseException):
+  print(f'通知ループでエラーが発生しました: {error}')
+
+
+@notification_loop.before_loop
+async def notification_loop_before():
   await client.wait_until_ready()
 
 
+todo_group = app_commands.Group(
+    name='todo', description='TODOの追加・一覧・完了・削除'
+)
 
+
+def split_chunks(header: str, lines: list[str], limit: int = 1900) -> list[str]:
+  """Discordの2000文字制限に収まるようにメッセージを分割する。"""
+  chunks: list[str] = []
+  current = header
+  for line in lines:
+    if len(current) + len(line) + 1 > limit:
+      chunks.append(current.rstrip('\n'))
+      current = ''
+    current += line + '\n'
+  if current.strip():
+    chunks.append(current.rstrip('\n'))
+  return chunks or [header.rstrip('\n')]
+
+
+def build_todo_lines(items: list[dict], now: datetime) -> list[str]:
+  """TODO一覧を「マーク ID 優先度 内容 + 期限」の行で組み立てる。"""
+  lines = []
+  for item in items:
+    if item['done']:
+      mark = '✅'
+    elif is_due_expired(item.get('due'), now):
+      mark = '❗'
+    else:
+      mark = '⬜'
+    lines.append(
+        f'{mark} **ID {item["id"]}** [{item["priority"]}] '
+        f'{escape_markdown(shorten(item["text"]))}\n'
+        f'-# {format_due_short(item.get("due"), now)}'
+    )
+  return lines
+
+
+def build_dashboard(user_id: int, now: datetime) -> discord.Embed:
+  """`/todo dashboard` の概要（件数＋未完了リスト）を作る。"""
+  stats = todo_store.stats(user_id)
+  items = todo_store.list_for_user(user_id)
+
+  embed = discord.Embed(
+      title='📋 TODO',
+      description=(
+          f'未完了 **{stats["open"]}件** / 完了 {stats["done"]}件\n'
+          f'今日締切 **{stats["today"]}件** ・ 期限切れ **{stats["overdue"]}件**'
+      ),
+      color=discord.Color.orange() if stats['overdue'] else discord.Color.blurple(),
+  )
+  if not items:
+    embed.add_field(
+        name='未完了のTODOはありません 🎉',
+        value='`/todo add 内容:買い物 期限:明日 18:00 優先度:高` で追加できます。',
+        inline=False,
+    )
+    return embed
+
+  embed.add_field(
+      name='未完了のTODO（優先度・期限順）',
+      value='\n'.join(build_todo_lines(items[:20], now))[:1024],
+      inline=False,
+  )
+  if len(items) > 20:
+    embed.set_footer(text=f'ほか{len(items) - 20}件は /todo list で確認できます')
+  else:
+    embed.set_footer(text='完了: /todo done 番号: / 追加: /todo add')
+  return embed
+
+
+@todo_group.command(
+    name='add', description='TODOを追加します（期限を指定すると期日にお知らせします）'
+)
+@app_commands.describe(
+    内容='やることを入力',
+    期限='任意。「今日 18:00」「明日 9:00」「11/20」「3日後」など',
+    優先度='任意。高 / 中 / 低（省略すると 中）',
+)
+async def todo_add(
+    interaction: discord.Interaction,
+    内容: app_commands.Range[str, 1, 500],
+    期限: app_commands.Range[str, 1, 100] | None = None,
+    優先度: app_commands.Choice[str] | None = None,
+):
+  now = todo_store.now()
+  due = None
+  if 期限:
+    try:
+      due = parse_due(期限, now)
+    except ReminderError as e:
+      await interaction.response.send_message(
+          f'⚠️ {e}', ephemeral=True, allowed_mentions=NO_MENTIONS
+      )
+      return
+
+  priority = 優先度.value if 優先度 else '中'
+  try:
+    item = todo_store.add(interaction.user.id, 内容, priority, due)
+  except TodoError as e:
+    await interaction.response.send_message(
+        f'⚠️ {e}', ephemeral=True, allowed_mentions=NO_MENTIONS
+    )
+    return
+
+  stats = todo_store.stats(interaction.user.id)
+  await interaction.response.send_message(
+      f'📋 TODOを追加しました（ID {item["id"]}）\n'
+      f'> {escape_markdown(shorten(item["text"]))}\n'
+      f'-# 優先度: {item["priority"]} / 期限: '
+      f'{format_due_short(item["due"], now)} / 未完了 {stats["open"]}件',
+      allowed_mentions=NO_MENTIONS,
+  )
+
+
+@todo_group.command(name='list', description='TODOを一覧表示します')
+@app_commands.describe(完了済み='完了したTODOも表示する')
+async def todo_list(interaction: discord.Interaction, 完了済み: bool = False):
+  now = todo_store.now()
+  items = todo_store.list_for_user(interaction.user.id, include_done=完了済み)
+  if not items:
+    await interaction.response.send_message(
+        '📋 TODOはまだありません。`/todo add 内容:...` で追加できます。',
+        ephemeral=True,
+        allowed_mentions=NO_MENTIONS,
+    )
+    return
+
+  stats = todo_store.stats(interaction.user.id)
+  header = f'📋 **TODO一覧**（未完了 {stats["open"]}件 / 完了 {stats["done"]}件）\n'
+  chunks = split_chunks(header, build_todo_lines(items, now))
+  await interaction.response.send_message(chunks[0], allowed_mentions=NO_MENTIONS)
+  for chunk in chunks[1:]:
+    await interaction.followup.send(chunk, allowed_mentions=NO_MENTIONS)
+
+
+@todo_group.command(name='done', description='TODOを完了（または未完了に戻す）します')
+@app_commands.describe(
+    番号='対象のTODOのID（/todo list で確認できます）',
+    戻す='True にすると未完了に戻します',
+)
+async def todo_done(
+    interaction: discord.Interaction,
+    番号: app_commands.Range[int, 1],
+    戻す: bool = False,
+):
+  try:
+    item = todo_store.set_done(interaction.user.id, 番号, done=not 戻す)
+  except TodoError as e:
+    await interaction.response.send_message(
+        f'⚠️ {e}', ephemeral=True, allowed_mentions=NO_MENTIONS
+    )
+    return
+
+  stats = todo_store.stats(interaction.user.id)
+  if item['done']:
+    message = (
+        f'✅ 完了にしました（ID {番号}）\n'
+        f'> ~~{escape_markdown(shorten(item["text"]))}~~\n'
+        f'-# 残りの未完了: {stats["open"]}件'
+    )
+    if stats['open'] == 0:
+      message += '\n🎉 未完了のTODOはすべて終わりました！'
+  else:
+    message = (
+        f'↩️ 未完了に戻しました（ID {番号}）\n'
+        f'> {escape_markdown(shorten(item["text"]))}'
+    )
+  await interaction.response.send_message(message, allowed_mentions=NO_MENTIONS)
+
+
+@todo_group.command(name='delete', description='TODOを削除します')
+@app_commands.describe(番号='削除するTODOのID（/todo list で確認できます）')
+async def todo_delete(
+    interaction: discord.Interaction, 番号: app_commands.Range[int, 1]
+):
+  try:
+    removed = todo_store.remove(interaction.user.id, 番号)
+  except TodoError as e:
+    await interaction.response.send_message(
+        f'⚠️ {e}', ephemeral=True, allowed_mentions=NO_MENTIONS
+    )
+    return
+
+  await interaction.response.send_message(
+      f'🗑️ TODOを削除しました（ID {番号}）\n'
+      f'> {escape_markdown(shorten(removed["text"]))}',
+      allowed_mentions=NO_MENTIONS,
+  )
+
+
+@todo_group.command(name='clear', description='完了済みのTODOをまとめて削除します')
+async def todo_clear(interaction: discord.Interaction):
+  removed = todo_store.clear_done(interaction.user.id)
+  if removed == 0:
+    await interaction.response.send_message(
+        '🧹 完了済みのTODOはありません。',
+        ephemeral=True,
+        allowed_mentions=NO_MENTIONS,
+    )
+    return
+  await interaction.response.send_message(
+      f'🧹 完了済みのTODOを{removed}件削除しました。',
+      allowed_mentions=NO_MENTIONS,
+  )
+
+
+@todo_done.autocomplete('番号')
+@todo_delete.autocomplete('番号')
+async def todo_id_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[int]]:
+  """IDを選びやすくするため、TODOの内容を候補として表示する。"""
+  current = (current or '').strip()
+  choices: list[app_commands.Choice[int]] = []
+  for item in todo_store.list_for_user(interaction.user.id, include_done=True):
+    mark = '✅' if item['done'] else '⬜'
+    label = f'{mark} ID {item["id"]}: {shorten(item["text"], 60)}'
+    if current and current not in label and not str(item['id']).startswith(current):
+      continue
+    choices.append(app_commands.Choice(name=label[:100], value=item['id']))
+    if len(choices) >= AUTOCOMPLETE_LIMIT:
+      break
+  return choices
+
+
+@todo_group.command(name='dashboard', description='TODOの概要を表示します')
+async def todo_dashboard(interaction: discord.Interaction):
+  embed = build_dashboard(interaction.user.id, todo_store.now())
+  await interaction.response.send_message(
+      embed=embed, allowed_mentions=NO_MENTIONS
+  )
+
+
+client.tree.add_command(todo_group)
 
 
 @client.tree.command(name='help', description='各コマンドの説明を表示します')
@@ -1229,6 +1753,48 @@ async def help_command(interaction: discord.Interaction):
       inline=False,
   )
   embed.add_field(
+      name='📋 `/todo dashboard`',
+      value=(
+          'TODOの概要（未完了・今日締切・期限切れの件数と一覧）を表示します。\n'
+          'コマンド一覧から `/todo` を選ぶとサブコマンドが表示されます。'
+      ),
+      inline=False,
+  )
+  embed.add_field(
+      name='➕ `/todo add 内容: [期限:] [優先度:]`',
+      value=(
+          'TODOを追加します。`期限` を指定すると、その時刻にDMでお知らせします。\n'
+          '`優先度` は 高 / 中 / 低（省略すると 中）。\n'
+          '期限の書き方はリマインダーと同じ（`今日 18:00` `明日` `11/20` `3日後`）。\n'
+          '例: `/todo add 内容:請求書を送る 期限:明日 10:00 優先度:高`'
+      ),
+      inline=False,
+  )
+  embed.add_field(
+      name='📋 `/todo list [完了済み:]`',
+      value=(
+          'TODOを優先度・期限順に一覧表示します（未完了を先に表示）。\n'
+          '`完了済み: True` で完了したTODOも表示します。'
+      ),
+      inline=False,
+  )
+  embed.add_field(
+      name='✅ `/todo done 番号: [戻す:]`',
+      value=(
+          'TODOを完了にします。`戻す: True` で未完了に戻せます。\n'
+          '番号（ID）は `/todo list` で確認できます。'
+      ),
+      inline=False,
+  )
+  embed.add_field(
+      name='🗑️ `/todo delete 番号:` / `/todo clear`',
+      value=(
+          '`delete` は指定したIDのTODOを削除します。\n'
+          '`clear` は完了済みのTODOをまとめて削除します。'
+      ),
+      inline=False,
+  )
+  embed.add_field(
       name='📝 `/memo list`',
       value='登録されているメモをすべて表示します。',
       inline=False,
@@ -1270,14 +1836,14 @@ async def help_command(interaction: discord.Interaction):
       inline=False,
   )
   embed.set_footer(
-      text=f'メモ・リマインダーはユーザーごとに保存されます（時刻は{reminder_store.timezone_name}）'
+      text=f'データはユーザーごとに保存されます（時刻は{reminder_store.timezone_name}）'
   )
   await interaction.response.send_message(
       embed=embed, ephemeral=True, allowed_mentions=NO_MENTIONS
   )
 
 
-# 10. Webサーバーを起動してからBotを動かす
+# 11. Webサーバーを起動してからBotを動かす
 if __name__ == '__main__':
   keep_alive()
   client.run(os.environ.get('DISCORD_BOT_TOKEN'))
