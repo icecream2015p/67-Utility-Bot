@@ -1,1 +1,9 @@
 .env
+
+# メモの保存ファイル（実行時に生成されるためコミットしない）
+memos.json
+memos.json.tmp
+
+# Python
+.venv/
+__pycache__/
